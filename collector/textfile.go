@@ -16,7 +16,9 @@
 package collector
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -40,6 +42,24 @@ var (
 		[]string{"file"},
 		nil,
 	)
+	// quarantineDirName stores snapshots of files that could not be parsed.
+	// It is a hidden directory without a .prom suffix, so it is never scraped
+	// itself and the configured collector paths stay unchanged.
+	quarantineDirName = ".textfile-quarantine"
+	// quarantineMaxSamplesPerFile keeps one bounded audit trail per source
+	// file so that repeatedly failing business metrics cannot fill the disk.
+	quarantineMaxSamplesPerFile = 5
+	// readSnapshotAttempts bounds retries when a file changes while it is read.
+	readSnapshotAttempts = 10
+	readSnapshotBackoff  = 20 * time.Millisecond
+
+	// parseTextfile is a function variable so tests can simulate a parser
+	// panic (the expfmt state machine has defensive panic paths) and verify
+	// the per-file recovery behavior deterministically.
+	parseTextfile = func(data []byte) (map[string]*dto.MetricFamily, error) {
+		parser := expfmt.NewTextParser(model.UTF8Validation)
+		return parser.TextToMetricFamilies(bytes.NewReader(data))
+	}
 )
 
 type textFileCollector struct {
@@ -48,6 +68,13 @@ type textFileCollector struct {
 	mtime  *float64
 	logger *slog.Logger
 }
+
+// validTextfileData is a complete, parseable exposition payload used by tests
+// that exercise concurrent writes.
+var validTextfileData = []byte(`# HELP business_metric A metric written by the business.
+# TYPE business_metric gauge
+business_metric 1
+`)
 
 func init() {
 	registerCollector("textfile", defaultEnabled, NewTextFileCollector)
@@ -208,12 +235,20 @@ func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 		}
 
 		for _, f := range files {
+			if f.IsDir() {
+				// The quarantine directory lives inside each configured
+				// directory but is never scraped; do not log it as an error.
+				if f.Name() == quarantineDirName {
+					continue
+				}
+				continue
+			}
 			metricsFilePath := filepath.Join(path, f.Name())
 			if !strings.HasSuffix(f.Name(), ".prom") {
 				continue
 			}
 
-			mtime, families, err := c.processFile(path, f.Name())
+			mtime, families, rawData, shouldQuarantine, err := c.processFile(path, f.Name())
 
 			for _, mf := range families {
 				// Check for metrics with inconsistent help texts and take the first help text occurrence.
@@ -239,7 +274,16 @@ func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 
 			if err != nil {
 				errored = true
-				c.logger.Error("failed to collect textfile data", "file", f.Name(), "err", err)
+				logArgs := []any{"file", metricsFilePath, "err", err}
+				if shouldQuarantine {
+					samplePath, quarantineErr := quarantineBadFile(path, f.Name(), rawData, err)
+					if quarantineErr != nil {
+						logArgs = append(logArgs, "quarantine_err", quarantineErr)
+					} else if samplePath != "" {
+						logArgs = append(logArgs, "quarantined", samplePath)
+					}
+				}
+				c.logger.Error("failed to collect textfile data", logArgs...)
 				continue
 			}
 
@@ -284,34 +328,217 @@ func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 	return nil
 }
 
-// processFile processes a single file, returning its modification time on success.
-func (c *textFileCollector) processFile(dir, name string) (*time.Time, map[string]*dto.MetricFamily, error) {
+// processFile processes a single file, returning its modification time on
+// success. The file is fully snapshotted before parsing so that a concurrent
+// rewrite can never expose a half-written file to the parser. On failure the
+// raw snapshot is returned as well, so the caller can preserve it for
+// inspection when quarantine is true (parse failures and parser panics).
+// Policy rejections such as client-side timestamps parse fine and are not
+// quarantined. A failing file never affects any other file in the directory.
+func (c *textFileCollector) processFile(dir, name string) (mtime *time.Time, families map[string]*dto.MetricFamily, rawData []byte, quarantine bool, err error) {
 	path := filepath.Join(dir, name)
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to open textfile data file %q: %w", path, err)
-	}
-	defer f.Close()
 
-	parser := expfmt.NewTextParser(model.UTF8Validation)
-	families, err := parser.TextToMetricFamilies(f)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse textfile data from %q: %w", path, err)
+	// The expfmt parser can panic on malformed input. Recover here so that one
+	// bad file cannot take down the whole scrape; the panic is turned into an
+	// ordinary per-file error and the snapshot is quarantined by the caller.
+	defer func() {
+		if r := recover(); r != nil {
+			mtime = nil
+			families = nil
+			quarantine = true
+			err = fmt.Errorf("panic while processing textfile data file %q: %v", path, r)
+		}
+	}()
+
+	// Retry the whole "snapshot + parse" cycle while the file is changing
+	// underneath us. A snapshot that parses successfully is by definition a
+	// complete, consistent view (old or new content), so the exporter never
+	// emits metrics derived from a half-written file. A snapshot that fails to
+	// parse is only treated as corruption when the file was stable while it
+	// was read; when the file was still changing, the failure is attributed to
+	// the in-progress write and the next attempt reads the file again. Because
+	// every scrape re-reads the directory, a repaired file is picked up
+	// automatically without a restart.
+	var lastErr error
+	parsed := false
+	for attempt := range readSnapshotAttempts {
+		if attempt > 0 {
+			time.Sleep(readSnapshotBackoff)
+		}
+
+		var readChanged bool
+		rawData, _, readChanged, err = readFileSnapshot(path)
+		if err != nil {
+			return nil, nil, nil, false, err
+		}
+
+		families, err = parseTextfile(rawData)
+		if err != nil && !readChanged {
+			// Stable bytes that still do not parse are genuinely corrupt:
+			// stop retrying and let the caller quarantine this file.
+			return nil, nil, rawData, true, fmt.Errorf("failed to parse textfile data from %q: %w", path, err)
+		}
+		if err != nil {
+			// The file changed during the read and the partial snapshot did
+			// not parse; retry in the hope of catching a complete version.
+			lastErr = err
+			continue
+		}
+		if readChanged {
+			// The snapshot parses, but the file moved underneath us while we
+			// read it, so the bytes cannot be trusted to represent one
+			// consistent version. Retry for a stable snapshot.
+			lastErr = fmt.Errorf("textfile data file %q changed while being read", path)
+			continue
+		}
+
+		// Stable snapshot that parses successfully: this is a complete,
+		// consistent view and is safe to export.
+		lastErr = nil
+		parsed = true
+		break
+	}
+	if !parsed {
+		return nil, nil, rawData, true, fmt.Errorf("failed to parse textfile data from %q after %d attempts: %w", path, readSnapshotAttempts, lastErr)
 	}
 
 	if hasTimestamps(families) {
-		return nil, nil, fmt.Errorf("textfile %q contains unsupported client-side timestamps, skipping entire file", path)
+		return nil, nil, rawData, false, fmt.Errorf("textfile %q contains unsupported client-side timestamps, skipping entire file", path)
 	}
 
 	// Only stat the file once it has been parsed and validated, so that
-	// a failure does not appear fresh.
-	stat, err := f.Stat()
+	// a failure does not appear fresh. Stat the path rather than the snapshot
+	// so the reported mtime reflects the file currently on disk.
+	stat, err := os.Stat(path)
 	if err != nil {
-		return nil, families, fmt.Errorf("failed to stat %q: %w", path, err)
+		return nil, families, rawData, false, fmt.Errorf("failed to stat %q: %w", path, err)
 	}
 
 	t := stat.ModTime()
-	return &t, families, nil
+	return &t, families, rawData, false, nil
+}
+
+// readFileSnapshot reads a full, point-in-time copy of the file and reports
+// whether the file changed while the read was in flight.
+//
+// Stat alone cannot detect a truncate-rewrite reliably: after O_TRUNC the
+// descriptor's reported size already reflects bytes being written (sparse
+// holes keep the size growing), so size and mtime can look stable while the
+// content underneath a completed read is still changing. Instead, after
+// reading, the file is re-opened and its bytes are compared with the
+// snapshot. Any mismatch (partial rewrite, atomic rename swap, append) is
+// reported as changed so the caller retries. Once the writer finishes, the
+// next attempt gets the complete new content, so recovery is automatic on
+// the following scrape without a restart.
+func readFileSnapshot(path string) ([]byte, os.FileInfo, bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to open textfile data file %q: %w", path, err)
+	}
+
+	stat, statErr := f.Stat()
+	data, readErr := io.ReadAll(f)
+	closeErr := f.Close()
+
+	switch {
+	case statErr != nil:
+		return nil, nil, false, fmt.Errorf("failed to stat textfile data file %q: %w", path, statErr)
+	case readErr != nil:
+		return nil, nil, false, fmt.Errorf("failed to read textfile data file %q: %w", path, readErr)
+	case closeErr != nil:
+		return nil, nil, false, fmt.Errorf("failed to close textfile data file %q: %w", path, closeErr)
+	}
+
+	// Re-open via the directory entry and compare bytes. A different inode
+	// (rename swap) or different content means the snapshot is not a stable
+	// point-in-time view.
+	verifyFile, err := os.Open(path)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to re-open textfile data file %q for verification: %w", path, err)
+	}
+	verifyStat, err := verifyFile.Stat()
+	verifyData, readErr := io.ReadAll(verifyFile)
+	_ = verifyFile.Close()
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to stat textfile data file %q during verification: %w", path, err)
+	}
+	if readErr != nil {
+		return nil, nil, false, fmt.Errorf("failed to verify textfile data file %q: %w", path, readErr)
+	}
+
+	changed := !os.SameFile(stat, verifyStat) || !bytes.Equal(data, verifyData)
+	// A complete exposition payload ends with a newline on its last line.
+	// A snapshot missing the trailing newline was cut off while the writer
+	// was still appending lines; on filesystems like tmpfs the truncate
+	// already exposes the final size, so size/mtime checks cannot catch this.
+	if !changed && len(data) > 0 && data[len(data)-1] != '\n' {
+		changed = true
+	}
+	return data, stat, changed, nil
+}
+
+// quarantineBadFile stores a copy of an unparseable textfile together with a
+// record explaining the failure, under <dir>/.textfile-quarantine/. The
+// quarantine directory contains no *.prom files, so it is never scraped, and
+// no existing path or format configuration is changed. Retained samples are
+// capped per source file. The returned path is empty when there is no data
+// to preserve (for example when the file could not be opened).
+func quarantineBadFile(dir, name string, data []byte, parseErr error) (string, error) {
+	if len(data) == 0 {
+		return "", nil
+	}
+
+	quarantineDir := filepath.Join(dir, quarantineDirName)
+	if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create quarantine directory %q: %w", quarantineDir, err)
+	}
+
+	timestamp := time.Now().UTC().Format("20060102T150405.000000000")
+	base := filepath.Base(name)
+	samplePath := filepath.Join(quarantineDir, base+"."+timestamp+".bad")
+	if err := os.WriteFile(samplePath, data, 0o644); err != nil {
+		return "", fmt.Errorf("failed to write quarantined sample %q: %w", samplePath, err)
+	}
+
+	recordPath := samplePath + ".reason"
+	record := fmt.Sprintf("source: %s\nquarantined_at: %s\nerror: %s\n",
+		filepath.Join(dir, name), timestamp, parseErr.Error())
+	if err := os.WriteFile(recordPath, []byte(record), 0o644); err != nil {
+		return samplePath, fmt.Errorf("failed to write quarantine record %q: %w", recordPath, err)
+	}
+
+	pruneQuarantine(quarantineDir, base)
+	return samplePath, nil
+}
+
+// pruneQuarantine keeps only the newest quarantineMaxSamplesPerFile samples
+// (and their .reason records) for one source file.
+func pruneQuarantine(quarantineDir, sourceBase string) {
+	prefix := sourceBase + "."
+	entries, err := os.ReadDir(quarantineDir)
+	if err != nil {
+		return
+	}
+
+	var samples []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		entryName := entry.Name()
+		if strings.HasPrefix(entryName, prefix) && strings.HasSuffix(entryName, ".bad") {
+			samples = append(samples, entryName)
+		}
+	}
+
+	sort.Strings(samples)
+	if len(samples) <= quarantineMaxSamplesPerFile {
+		return
+	}
+	for _, stale := range samples[:len(samples)-quarantineMaxSamplesPerFile] {
+		_ = os.Remove(filepath.Join(quarantineDir, stale))
+		_ = os.Remove(filepath.Join(quarantineDir, stale+".reason"))
+	}
 }
 
 // hasTimestamps returns true when metrics contain unsupported timestamps.

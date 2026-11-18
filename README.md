@@ -375,6 +375,28 @@ echo 'role{role="application_server"} 1' > /path/to/directory/role.prom.$$
 mv /path/to/directory/role.prom.$$ /path/to/directory/role.prom
 ```
 
+#### Reading files that are being rewritten
+
+Business jobs sometimes write a `*.prom` file in place (truncate and rewrite)
+instead of using the atomic rename pattern above. The collector reads each
+file into an in-memory snapshot, verifies the snapshot is stable (the file
+was not swapped or modified while it was read, including a trailing-newline
+check) and only then parses it. If the file is still changing, the read is
+retried with backoff instead of handing a half-written file to the parser.
+This means a scrape never fails just because it happened while a file was
+being rewritten; once the write finishes the next scrape picks up the new
+content automatically, no restart required.
+
+Parse failures are contained to the offending file: metrics from every other
+file in the directory are still exported, and `node_textfile_scrape_error` is
+set to `1`. A file that cannot be parsed (or that panics the exposition
+parser) is copied, together with a `*.reason` record naming the source file
+and the parse error, into the hidden, non-scraped directory
+`<collector.textfile.directory>/.textfile-quarantine/`, so bad samples can be
+reviewed offline. At most five samples per source file are retained to bound
+disk usage. Policy rejections such as unsupported client-side timestamps are
+not quarantined because the file itself is valid.
+
 ### Filtering enabled collectors
 
 The `node_exporter` will expose all metrics from enabled collectors by default.  This is the recommended way to collect metrics to avoid errors when comparing metrics of different families.
