@@ -133,6 +133,13 @@ func NewNodeCollector(logger *slog.Logger, filters ...string) (*NodeCollector, e
 			initiatedCollectors[key] = collector
 		}
 	}
+	enabledCollectors := make([]string, 0, len(collectors))
+	for key := range collectors {
+		enabledCollectors = append(enabledCollectors, key)
+	}
+	if err := validateLabelContracts(enabledCollectors); err != nil {
+		return nil, err
+	}
 	return &NodeCollector{Collectors: collectors, logger: logger}, nil
 }
 

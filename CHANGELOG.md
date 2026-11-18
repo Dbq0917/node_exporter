@@ -1,5 +1,7 @@
 ## master / unreleased
 
+* [FEATURE] collector: Validate metric label contracts at startup so two collectors cannot export the same metric name with different label semantics; merge rules and the label mapping table are documented in `docs/LABELS.md`
+
 ## 1.13.0 / 2026-11-19
 
 NOTE:

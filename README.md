@@ -398,6 +398,14 @@ Collect all enabled collector metrics but exclude `netdev`:
 
 This can be useful for having different Prometheus servers collect specific metrics from nodes.
 
+## Metric label semantics
+
+Label names shared between collectors (e.g. `device`, `mode`) can mean
+different things on different metrics. The meaning of each shared label and
+the rules that prevent two collectors from exporting the same metric name
+with different label semantics are documented in
+[docs/LABELS.md](docs/LABELS.md) and enforced at startup.
+
 ## Development building and running
 
 Prerequisites:
