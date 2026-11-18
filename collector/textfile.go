@@ -34,19 +34,29 @@ import (
 
 var (
 	textFileDirectories = kingpin.Flag("collector.textfile.directory", "Directory to read text files with metrics from, supports glob matching. (repeatable)").Default("").Strings()
+	textFileStaleAfter  = kingpin.Flag("collector.textfile.stale-after", "Files not modified within this duration are considered stale: their metrics are no longer exported and node_textfile_file_stale is set to 1. Set to 0 to disable staleness handling.").Default("0").Duration()
 	mtimeDesc           = prometheus.NewDesc(
 		"node_textfile_mtime_seconds",
 		"Unixtime mtime of textfiles successfully read.",
 		[]string{"file"},
 		nil,
 	)
+	staleDesc = prometheus.NewDesc(
+		"node_textfile_file_stale",
+		"1 if the textfile is older than collector.textfile.stale-after and its metrics are no longer exported, 0 otherwise. Only exported when staleness handling is enabled.",
+		[]string{"file"},
+		nil,
+	)
 )
 
 type textFileCollector struct {
-	paths []string
+	paths      []string
+	staleAfter time.Duration
 	// Only set for testing to get predictable output.
 	mtime  *float64
 	logger *slog.Logger
+	// Only set for testing to control staleness decisions.
+	now func() time.Time
 }
 
 func init() {
@@ -57,10 +67,24 @@ func init() {
 // in the given textfile directory.
 func NewTextFileCollector(logger *slog.Logger) (Collector, error) {
 	c := &textFileCollector{
-		paths:  *textFileDirectories,
-		logger: logger,
+		paths:      *textFileDirectories,
+		staleAfter: *textFileStaleAfter,
+		logger:     logger,
 	}
 	return c, nil
+}
+
+// isStale reports whether a file with the given modification time has not
+// been refreshed within the configured staleness window.
+func (c *textFileCollector) isStale(mtime time.Time) bool {
+	if c.staleAfter <= 0 {
+		return false
+	}
+	now := time.Now
+	if c.now != nil {
+		now = c.now
+	}
+	return now().Sub(mtime) > c.staleAfter
 }
 
 func convertMetricFamily(metricFamily *dto.MetricFamily, ch chan<- prometheus.Metric, logger *slog.Logger) {
@@ -200,6 +224,7 @@ func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 	}
 
 	mtimes := make(map[string]time.Time)
+	staleFiles := make(map[string]bool)
 	for _, path := range paths {
 		files, err := os.ReadDir(path)
 		if err != nil && path != "" {
@@ -215,7 +240,19 @@ func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 
 			mtime, families, err := c.processFile(path, f.Name())
 
+			// A file that has not been refreshed within the staleness
+			// window is expired: its metrics must not be exported, so
+			// that consumers see the series go stale instead of
+			// observing old values with fresh scrape timestamps.
+			stale := err == nil && c.isStale(*mtime)
+			if stale {
+				c.logger.Warn("textfile is stale, skipping its metrics", "file", metricsFilePath, "mtime", mtime, "stale_after", c.staleAfter)
+			}
+
 			for _, mf := range families {
+				if stale {
+					continue
+				}
 				// Check for metrics with inconsistent help texts and take the first help text occurrence.
 				if helpTexts, seen := metricsNamesToHelpTexts[*mf.Name]; seen {
 					if mf.Help != nil && helpTexts[0] != *mf.Help || helpTexts[1] != "" {
@@ -244,6 +281,7 @@ func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 			}
 
 			mtimes[metricsFilePath] = *mtime
+			staleFiles[metricsFilePath] = stale
 		}
 	}
 
@@ -265,6 +303,24 @@ func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 	}
 
 	c.exportMTimes(mtimes, ch)
+
+	// Export the staleness state of every successfully read file, but
+	// only when staleness handling is enabled, so that the default
+	// metric output is unchanged.
+	if c.staleAfter > 0 {
+		filepaths := make([]string, 0, len(staleFiles))
+		for path := range staleFiles {
+			filepaths = append(filepaths, path)
+		}
+		sort.Strings(filepaths)
+		for _, path := range filepaths {
+			var staleVal float64
+			if staleFiles[path] {
+				staleVal = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(staleDesc, prometheus.GaugeValue, staleVal, path)
+		}
+	}
 
 	// Export if there were errors.
 	var errVal float64

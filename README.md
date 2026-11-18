@@ -363,6 +363,19 @@ collector will parse all files in that directory matching the glob `*.prom`
 using the [text
 format](http://prometheus.io/docs/instrumenting/exposition_formats/). **Note:** Timestamps are not supported.
 
+#### Staleness handling
+
+Files in the textfile directory are re-read on every scrape, so metrics from a
+file whose producer has stopped (e.g. after a reboot, before its cron job runs
+again) would otherwise be exported indefinitely with fresh scrape timestamps.
+Set `--collector.textfile.stale-after` (e.g. `5m`) to expire such files: once
+a file's modification time is older than the given duration, its metrics are
+no longer exported and `node_textfile_file_stale{file="..."}` is set to `1`
+(`0` for fresh files). `node_textfile_mtime_seconds` keeps reporting the file
+modification time either way. As soon as the producer writes a fresh file, the
+metrics are exported again on the next scrape. The default of `0` disables
+staleness handling and preserves the previous behavior.
+
 To atomically push completion time for a cron job:
 ```
 echo my_batch_job_completion_time $(date +%s) > /path/to/directory/my_batch_job.prom.$$
