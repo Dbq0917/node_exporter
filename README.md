@@ -398,6 +398,84 @@ Collect all enabled collector metrics but exclude `netdev`:
 
 This can be useful for having different Prometheus servers collect specific metrics from nodes.
 
+## Multi-target aggregation exporter
+
+The standard `node_exporter` exposes the metrics of the machine it runs on. When a single process has to collect from many remote hosts (for example a central poller in one datacenter), the separate `node_exporter_multitarget` binary aggregates the metrics of many remote `node_exporter` instances behind one exposition endpoint.
+
+It is an independent component: the single-host `node_exporter` binary, its flags, and the scraped `node_*` metric names are all unchanged. The aggregator only adds its own `node_multitarget_*` self-monitoring metrics.
+
+### Failure isolation and time budgets
+
+- Every target is scraped with its own deadline (`--scrape.target-timeout`). A target that stops answering is aborted after that deadline and is recorded as a failure; it never delays or removes the metrics of any other target.
+- One collection round has a configurable total time budget (`--scrape.round-timeout`). Targets still in flight when the budget elapses are cancelled and counted as failures, so a round always returns in bounded time regardless of how many hosts hang. The round budget may be smaller than the target timeout to cap total round latency.
+- Concurrent in-flight scrapes are capped with `--scrape.concurrency` to keep socket usage bounded at the hundred-target scale.
+
+### Targets file
+
+Targets are read from the file given by `--targets.file`, one target per line using `"<name> <url>"`. Blank lines and lines starting with `#` are ignored:
+
+```
+# name               url
+host-a                 http://10.0.0.11:9100/metrics
+host-b                 http://10.0.0.12:9100/metrics
+```
+
+Every scraped metric receives a `target="<name>"` label so samples from different machines stay distinguishable after aggregation.
+
+### Aggregator flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--targets.file` | `/etc/node_exporter/multitarget/targets.txt` | File listing the remote targets as `"<name> <url>"`. |
+| `--scrape.target-timeout` | `10s` | Per-target scrape deadline. A hung target only fails itself. |
+| `--scrape.round-timeout` | `60s` | Total time budget for one round across all targets. Tune this per datacenter network conditions. |
+| `--scrape.concurrency` | `20` | Maximum number of targets scraped concurrently. |
+| `--web.listen-address` | `:19101` | Addresses on which to expose metrics and the web interface. |
+
+All configuration is via CLI flags; there are no environment-variable flags.
+
+### Self-monitoring metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `node_multitarget_scrape_rounds_total` | counter | | Total collection rounds since startup. |
+| `node_multitarget_scrape_round_duration_seconds` | gauge | | Wall-clock duration of the most recent whole round. |
+| `node_multitarget_scrape_round_timeout_total` | counter | | Rounds that exhausted the configured round time budget. |
+| `node_multitarget_scrape_targets` | gauge | | Number of configured targets. |
+| `node_multitarget_target_up` | gauge | `target` | `1` if the most recent scrape of the target succeeded, else `0`. |
+| `node_multitarget_target_scrape_duration_seconds` | gauge | `target` | Duration of the most recent scrape of the target. |
+| `node_multitarget_target_scrape_failures_total` | counter | `target`, `reason` | Cumulative target scrape failures by reason (`timeout`, `round_budget`, `http_status`, `parse`, `transport`). |
+| `node_multitarget_target_failure_ratio` | gauge | | Fraction of targets that failed in the most recent round, `0` to `1`. |
+
+The failure ratio of the latest round is available directly:
+
+```promql
+node_multitarget_target_failure_ratio
+```
+
+The cumulative failure rate over any time window is computed from the counters:
+
+```promql
+sum(rate(node_multitarget_target_scrape_failures_total[5m]))
+  / count(node_multitarget_target_up)
+```
+
+To find the currently failing targets:
+
+```promql
+node_multitarget_target_up == 0
+```
+
+### Verification at scale
+
+`multitarget/verify_e2e.sh` starts 100 mock targets (99 healthy, one that never answers), runs the real aggregator with a 2 second round budget, and asserts that all 99 healthy targets still produce metrics while the hung target is recorded with `reason="timeout"` and a failure ratio of `0.01` (1/100). It writes reviewable evidence to `artifacts/e2e/`:
+
+```
+go build -o artifacts/node_exporter_multitarget ./cmd/multitarget
+./multitarget/verify_e2e.sh
+cat artifacts/e2e/summary.txt
+```
+
 ## Development building and running
 
 Prerequisites:

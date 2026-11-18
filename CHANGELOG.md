@@ -1,5 +1,7 @@
 ## master / unreleased
 
+* [FEATURE] Add `node_exporter_multitarget` multi-target aggregation binary with per-target timeout, configurable round-wide time budget, per-target failure metrics (`node_multitarget_target_scrape_failures_total`) and failure ratio (`node_multitarget_target_failure_ratio`). Scraped `node_*` metric names are unchanged.
+
 ## 1.13.0 / 2026-11-19
 
 NOTE:
