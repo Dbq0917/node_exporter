@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus"
@@ -46,14 +47,16 @@ type handler struct {
 	exporterMetricsRegistry *prometheus.Registry
 	includeExporterMetrics  bool
 	maxRequests             int
+	collectCacheTTL         time.Duration
 	logger                  *slog.Logger
 }
 
-func newHandler(includeExporterMetrics bool, maxRequests int, logger *slog.Logger) *handler {
+func newHandler(includeExporterMetrics bool, maxRequests int, collectCacheTTL time.Duration, logger *slog.Logger) *handler {
 	h := &handler{
 		exporterMetricsRegistry: prometheus.NewRegistry(),
 		includeExporterMetrics:  includeExporterMetrics,
 		maxRequests:             maxRequests,
+		collectCacheTTL:         collectCacheTTL,
 		logger:                  logger,
 	}
 	if h.includeExporterMetrics {
@@ -140,7 +143,11 @@ func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
 
 	r := prometheus.NewRegistry()
 	r.MustRegister(versioncollector.NewCollector("node_exporter"))
-	if err := r.Register(nc); err != nil {
+	var nodeCollector prometheus.Collector = nc
+	if h.collectCacheTTL > 0 {
+		nodeCollector = collector.NewCachedCollector(nc, h.collectCacheTTL, h.logger)
+	}
+	if err := r.Register(nodeCollector); err != nil {
 		return nil, fmt.Errorf("couldn't register node collector: %s", err)
 	}
 
@@ -180,6 +187,10 @@ func main() {
 			"collector.disable-defaults",
 			"Set all collectors to disabled by default.",
 		).Default("false").Bool()
+		collectCacheTTL = kingpin.Flag(
+			"web.collect-cache-ttl",
+			"Cache collected metrics for the given duration so scrapes within the same period share one collection round. 0 disables the cache and every scrape collects directly.",
+		).Default("0s").Duration()
 		maxProcs = kingpin.Flag(
 			"runtime.gomaxprocs", "The target number of CPUs Go will run on (GOMAXPROCS)",
 		).Envar("GOMAXPROCS").Default("1").Int()
@@ -201,7 +212,7 @@ func main() {
 			runtime.GOMAXPROCS(*maxProcs)
 			b.Logger.Debug("Go MAXPROCS", "procs", runtime.GOMAXPROCS(0))
 			b.Handle("/debug/pprof/", http.DefaultServeMux)
-			return newHandler(!b.DisableExporterMetrics, b.MaxRequests, b.Logger), nil
+			return newHandler(!b.DisableExporterMetrics, b.MaxRequests, *collectCacheTTL, b.Logger), nil
 		},
 	})
 

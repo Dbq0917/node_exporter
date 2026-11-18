@@ -1,5 +1,7 @@
 ## master / unreleased
 
+* [FEATURE] Add `--web.collect-cache-ttl` flag to share one collection round across concurrent scrapes within a configurable TTL period, with non-blocking stale-while-revalidate refreshes and `node_scrape_cache_*` metrics
+
 ## 1.13.0 / 2026-11-19
 
 NOTE:

@@ -398,6 +398,39 @@ Collect all enabled collector metrics but exclude `netdev`:
 
 This can be useful for having different Prometheus servers collect specific metrics from nodes.
 
+### Collection cache
+
+By default every scrape of the `/metrics` endpoint triggers a full collection
+round. When several Prometheus servers scrape the same node concurrently this
+multiplies the load on the underlying data sources (for example `/proc`,
+`/sys` or local sockets). The `--web.collect-cache-ttl` flag caches the
+collected metrics for the given duration:
+
+- scrapes within the same TTL period share a single collection round,
+- the cached snapshot expires after the TTL and is refreshed in the
+  background while stale metrics are still served immediately, so a slow
+  collection never blocks a scrape,
+- the very first scrape after startup waits for the initial collection.
+
+The default value `0s` disables the cache and preserves the historical
+behavior. Each collector instance (the unfiltered handler and every
+`collect[]` / `exclude[]` filter combination) keeps an independent cache.
+
+When caching is enabled the endpoint additionally exposes `node_scrape_cache_*`
+metrics describing cache operation, including collection round counters and
+whether the served snapshot was reused or freshly collected:
+
+| Metric | Description |
+| --- | --- |
+| `node_scrape_cache_requests_total` | Total scrapes served by the cache. |
+| `node_scrape_cache_reused_total` | Scrapes that reused a cached snapshot. |
+| `node_scrape_cache_collections_total` | Upstream collection rounds triggered. |
+| `node_scrape_cache_collection_failures_total` | Failed collection rounds. |
+| `node_scrape_cache_refreshing` | `1` while a background refresh is running. |
+| `node_scrape_cache_snapshot_age_seconds` | Age of the snapshot served to the current scrape. |
+| `node_scrape_cache_snapshot_cached` | `1` when the snapshot was reused, `0` for an inline fresh collection. |
+| `node_scrape_cache_last_collection_success_timestamp_seconds` | Unix timestamp of the last successful collection. |
+
 ## Development building and running
 
 Prerequisites:
