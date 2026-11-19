@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"sync"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus"
@@ -38,6 +39,9 @@ import (
 // created on the fly, if filtering is requested. Create instances with
 // newHandler.
 type handler struct {
+	mu       sync.RWMutex
+	reloadMu sync.RWMutex
+
 	unfilteredHandler http.Handler
 	// enabledCollectors list is used for logging and filtering
 	enabledCollectors []string
@@ -78,9 +82,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	excludes := r.URL.Query()["exclude[]"]
 	h.logger.Debug("exclude query:", "excludes", excludes)
 
+	h.mu.RLock()
+	unfilteredHandler := h.unfilteredHandler
+	enabledCollectors := append([]string(nil), h.enabledCollectors...)
+	h.mu.RUnlock()
+
 	if len(collects) == 0 && len(excludes) == 0 {
 		// No filters, use the prepared unfiltered handler.
-		h.unfilteredHandler.ServeHTTP(w, r)
+		unfilteredHandler.ServeHTTP(w, r)
 		return
 	}
 
@@ -95,7 +104,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(excludes) > 0 {
 		// In exclude mode, filtered collectors = enabled - excludeed.
 		f := []string{}
-		for _, c := range h.enabledCollectors {
+		for _, c := range enabledCollectors {
 			if slices.Index(excludes, c) == -1 {
 				f = append(f, c)
 			}
@@ -120,28 +129,82 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // (in which case it will log all the collectors enabled via command-line
 // flags).
 func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
-	nc, err := collector.NewNodeCollector(h.logger, filters...)
+	h.reloadMu.RLock()
+	defer h.reloadMu.RUnlock()
+
+	handler, enabled, err := h.buildHandler(filters...)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't create collector: %s", err)
+		return nil, err
 	}
 
-	// Only log the creation of an unfiltered handler, which should happen
-	// only once upon startup.
 	if len(filters) == 0 {
-		h.logger.Info("Enabled collectors")
-		for n := range nc.Collectors {
-			h.enabledCollectors = append(h.enabledCollectors, n)
-		}
-		sort.Strings(h.enabledCollectors)
-		for _, c := range h.enabledCollectors {
-			h.logger.Info(c)
+		h.setUnfilteredHandler(handler, enabled)
+	}
+
+	return handler, nil
+}
+
+// Reload builds a complete collector registry from the current collector
+// configuration and atomically swaps it in. Scrapes already in flight keep
+// using the previous registry until they finish, and new scrapes see either
+// the complete old configuration or the complete new one.
+func (h *handler) Reload() error {
+	return h.ReloadWith(nil)
+}
+
+// ReloadWith applies configure and builds the replacement registry while
+// holding the reload lock. Filtered handler construction waits for the swap,
+// so it cannot observe a configuration that is not active yet.
+func (h *handler) ReloadWith(configure func() error) error {
+	h.reloadMu.Lock()
+	defer h.reloadMu.Unlock()
+
+	if configure != nil {
+		if err := configure(); err != nil {
+			return err
 		}
 	}
+	handler, enabled, err := h.buildHandler()
+	if err != nil {
+		return err
+	}
+	h.setUnfilteredHandler(handler, enabled)
+	return nil
+}
+
+func (h *handler) setUnfilteredHandler(handler http.Handler, enabled []string) {
+	h.mu.Lock()
+	h.unfilteredHandler = handler
+	h.enabledCollectors = enabled
+	h.mu.Unlock()
+
+	// Collectors which are no longer enabled are not referenced by the new
+	// registry. Drop them from the shared cache so they can be garbage
+	// collected once any in-flight scrape using them finishes.
+	collector.PruneCollectors(enabled)
+
+	h.logger.Info("Enabled collectors")
+	for _, c := range enabled {
+		h.logger.Info(c)
+	}
+}
+
+func (h *handler) buildHandler(filters ...string) (http.Handler, []string, error) {
+	nc, err := collector.NewNodeCollector(h.logger, filters...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("couldn't create collector: %s", err)
+	}
+
+	enabled := make([]string, 0, len(nc.Collectors))
+	for n := range nc.Collectors {
+		enabled = append(enabled, n)
+	}
+	sort.Strings(enabled)
 
 	r := prometheus.NewRegistry()
 	r.MustRegister(versioncollector.NewCollector("node_exporter"))
 	if err := r.Register(nc); err != nil {
-		return nil, fmt.Errorf("couldn't register node collector: %s", err)
+		return nil, nil, fmt.Errorf("couldn't register node collector: %s", err)
 	}
 
 	var handler http.Handler
@@ -171,7 +234,7 @@ func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
 		)
 	}
 
-	return handler, nil
+	return handler, enabled, nil
 }
 
 func main() {
@@ -183,6 +246,10 @@ func main() {
 		maxProcs = kingpin.Flag(
 			"runtime.gomaxprocs", "The target number of CPUs Go will run on (GOMAXPROCS)",
 		).Envar("GOMAXPROCS").Default("1").Int()
+		collectorConfigFile = kingpin.Flag(
+			"collector.config.file",
+			"Path to a file listing the collectors to enable. Reloaded on SIGHUP.",
+		).String()
 	)
 
 	kingpin.CommandLine.UsageWriter(os.Stdout)
@@ -198,10 +265,19 @@ func main() {
 			if user, err := user.Current(); err == nil && user.Uid == "0" {
 				b.Logger.Warn("Node Exporter is running as root user. This exporter is designed to run as unprivileged user, root is not required.")
 			}
+			if *collectorConfigFile != "" {
+				if err := applyCollectorConfigFile(*collectorConfigFile); err != nil {
+					return nil, fmt.Errorf("couldn't load collector configuration: %w", err)
+				}
+			}
 			runtime.GOMAXPROCS(*maxProcs)
 			b.Logger.Debug("Go MAXPROCS", "procs", runtime.GOMAXPROCS(0))
 			b.Handle("/debug/pprof/", http.DefaultServeMux)
-			return newHandler(!b.DisableExporterMetrics, b.MaxRequests, b.Logger), nil
+			h := newHandler(!b.DisableExporterMetrics, b.MaxRequests, b.Logger)
+			if *collectorConfigFile != "" {
+				startCollectorConfigReloader(*collectorConfigFile, h, b.Logger)
+			}
+			return h, nil
 		},
 	})
 

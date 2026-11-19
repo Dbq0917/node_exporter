@@ -398,6 +398,26 @@ Collect all enabled collector metrics but exclude `netdev`:
 
 This can be useful for having different Prometheus servers collect specific metrics from nodes.
 
+### Reloading collector configuration
+
+Use `--collector.config.file` to define the complete set of enabled collectors in
+a file. The file accepts a JSON array or a line-oriented/YAML list:
+
+```yaml
+collectors:
+  - cpu
+  - meminfo
+  - textfile
+```
+
+Send `SIGHUP` to reload the file. The exporter builds the replacement collector
+registry first, then swaps it in atomically. Scrapes already in progress finish
+against the old configuration, and subsequent scrapes see the complete new
+configuration, so no scrape exposes both generations of a collector.
+
+If the new file is invalid, or a collector fails to initialize, the previous
+configuration stays active and the reload error is logged.
+
 ## Development building and running
 
 Prerequisites:

@@ -50,6 +50,7 @@ const (
 
 var (
 	factories              = make(map[string]func(logger *slog.Logger) (Collector, error))
+	collectorStateMtx      = sync.RWMutex{}
 	initiatedCollectorsMtx = sync.Mutex{}
 	initiatedCollectors    = make(map[string]Collector)
 	collectorState         = make(map[string]*bool)
@@ -69,7 +70,9 @@ func registerCollector(collector string, isDefaultEnabled bool, factory func(log
 	defaultValue := fmt.Sprintf("%v", isDefaultEnabled)
 
 	flag := kingpin.Flag(flagName, flagHelp).Default(defaultValue).Action(collectorFlagAction(collector)).Bool()
+	collectorStateMtx.Lock()
 	collectorState[collector] = flag
+	collectorStateMtx.Unlock()
 
 	factories[collector] = factory
 }
@@ -83,9 +86,65 @@ type NodeCollector struct {
 // DisableDefaultCollectors sets the collector state to false for all collectors which
 // have not been explicitly enabled on the command line.
 func DisableDefaultCollectors() {
+	collectorStateMtx.Lock()
+	defer collectorStateMtx.Unlock()
 	for c := range collectorState {
 		if _, ok := forcedCollectors[c]; !ok {
 			*collectorState[c] = false
+		}
+	}
+}
+
+// CollectorStates returns a snapshot of the enabled state of every collector.
+func CollectorStates() map[string]bool {
+	collectorStateMtx.RLock()
+	defer collectorStateMtx.RUnlock()
+
+	states := make(map[string]bool, len(collectorState))
+	for name, enabled := range collectorState {
+		states[name] = *enabled
+	}
+	return states
+}
+
+// ApplyEnabledCollectors makes enabled the complete set of active collectors.
+// Collectors which are not listed are disabled. The update is applied as one
+// atomic state change so concurrent collector construction never observes a
+// partially applied configuration.
+func ApplyEnabledCollectors(enabled []string) error {
+	collectorStateMtx.Lock()
+	defer collectorStateMtx.Unlock()
+
+	wanted := make(map[string]struct{}, len(enabled))
+	for _, name := range enabled {
+		if _, ok := collectorState[name]; !ok {
+			return fmt.Errorf("unknown collector: %s", name)
+		}
+		wanted[name] = struct{}{}
+	}
+	for name, state := range collectorState {
+		_, ok := wanted[name]
+		*state = ok
+	}
+	PruneCollectors(enabled)
+	return nil
+}
+
+// PruneCollectors drops cached collector instances which are not part of the
+// active set. Instances still referenced by an in-flight scrape stay alive
+// until that scrape finishes; they are simply no longer reused by new handler
+// generations.
+func PruneCollectors(active []string) {
+	keep := make(map[string]struct{}, len(active))
+	for _, name := range active {
+		keep[name] = struct{}{}
+	}
+
+	initiatedCollectorsMtx.Lock()
+	defer initiatedCollectorsMtx.Unlock()
+	for name := range initiatedCollectors {
+		if _, ok := keep[name]; !ok {
+			delete(initiatedCollectors, name)
 		}
 	}
 }
@@ -104,13 +163,20 @@ func collectorFlagAction(collector string) func(ctx *kingpin.ParseContext) error
 
 // NewNodeCollector creates a new NodeCollector.
 func NewNodeCollector(logger *slog.Logger, filters ...string) (*NodeCollector, error) {
+	collectorStateMtx.RLock()
+	states := make(map[string]bool, len(collectorState))
+	for name, enabled := range collectorState {
+		states[name] = *enabled
+	}
+	collectorStateMtx.RUnlock()
+
 	f := make(map[string]bool)
 	for _, filter := range filters {
-		enabled, exist := collectorState[filter]
+		enabled, exist := states[filter]
 		if !exist {
 			return nil, fmt.Errorf("missing collector: %s", filter)
 		}
-		if !*enabled {
+		if !enabled {
 			return nil, fmt.Errorf("disabled collector: %s", filter)
 		}
 		f[filter] = true
@@ -118,8 +184,8 @@ func NewNodeCollector(logger *slog.Logger, filters ...string) (*NodeCollector, e
 	collectors := make(map[string]Collector)
 	initiatedCollectorsMtx.Lock()
 	defer initiatedCollectorsMtx.Unlock()
-	for key, enabled := range collectorState {
-		if !*enabled || (len(f) > 0 && !f[key]) {
+	for key, enabled := range states {
+		if !enabled || (len(f) > 0 && !f[key]) {
 			continue
 		}
 		if collector, ok := initiatedCollectors[key]; ok {
