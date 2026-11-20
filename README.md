@@ -89,6 +89,13 @@ There are two meta-monitoring metrics available for checking the status of colle
     node_scrape_collector_success
     node_scrape_collector_duration_seconds
 
+If a collector fails during a scrape, the series it exposed on its last successful
+scrape are still exported, but with a `NaN` sample value. A `NaN` sample means the
+series exists but its value is currently unavailable, which is different from a
+series that is absent because the collector legitimately found no data. The next
+successful scrape replaces the `NaN` placeholders with fresh samples automatically.
+Successful scrapes do not expose any additional series.
+
 Note that if a configured collector reads no data because it can't find a file in `/proc` or `/sys`,
 the success status will be 0. This is intentional to provide a way to detect faild drivers and similar
 problems.

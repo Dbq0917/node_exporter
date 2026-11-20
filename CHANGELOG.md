@@ -1,5 +1,7 @@
 ## master / unreleased
 
+* [ENHANCEMENT] collectors: expose the last successful series of a failed collector with a `NaN` value instead of dropping it, while keeping no-data collectors absent
+
 ## 1.13.1 / 2026-11-19
 
 * [BUGFIX] btrfs: Fix device_unused_bytes wrapping around during shrink #3827

@@ -18,11 +18,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"google.golang.org/protobuf/proto"
 )
 
 // Namespace defines the common namespace to be used by all metrics.
@@ -54,6 +57,7 @@ var (
 	initiatedCollectors    = make(map[string]Collector)
 	collectorState         = make(map[string]*bool)
 	forcedCollectors       = map[string]bool{} // collectors which have been explicitly enabled or disabled
+	defaultResults         collectorResults
 )
 
 func registerCollector(collector string, isDefaultEnabled bool, factory func(logger *slog.Logger) (Collector, error)) {
@@ -78,6 +82,39 @@ func registerCollector(collector string, isDefaultEnabled bool, factory func(log
 type NodeCollector struct {
 	Collectors map[string]Collector
 	logger     *slog.Logger
+	results    *collectorResults
+}
+
+// collectorResults keeps the last successful series of each collector. When a
+// collector fails, those series are exposed again with a NaN sample value so
+// that a failure is distinguishable from a collector that never had any data.
+type collectorResults struct {
+	mu   sync.Mutex
+	last map[string][]prometheus.Metric
+}
+
+func (r *collectorResults) store(name string, metrics []prometheus.Metric) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.last == nil {
+		r.last = make(map[string][]prometheus.Metric)
+	}
+	r.last[name] = append([]prometheus.Metric(nil), metrics...)
+}
+
+func (r *collectorResults) load(name string) []prometheus.Metric {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]prometheus.Metric(nil), r.last[name]...)
+}
+
+func (r *collectorResults) clear(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.last, name)
 }
 
 // DisableDefaultCollectors sets the collector state to false for all collectors which
@@ -133,7 +170,7 @@ func NewNodeCollector(logger *slog.Logger, filters ...string) (*NodeCollector, e
 			initiatedCollectors[key] = collector
 		}
 	}
-	return &NodeCollector{Collectors: collectors, logger: logger}, nil
+	return &NodeCollector{Collectors: collectors, logger: logger, results: &collectorResults{}}, nil
 }
 
 // Describe implements the prometheus.Collector interface.
@@ -144,11 +181,16 @@ func (n NodeCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect implements the prometheus.Collector interface.
 func (n NodeCollector) Collect(ch chan<- prometheus.Metric) {
+	results := n.results
+	if results == nil {
+		results = &defaultResults
+	}
+
 	wg := sync.WaitGroup{}
 	wg.Add(len(n.Collectors))
 	for name, c := range n.Collectors {
 		go func(name string, c Collector) {
-			execute(name, c, ch, n.logger)
+			executeWithResults(name, c, ch, n.logger, results)
 			wg.Done()
 		}(name, c)
 	}
@@ -156,24 +198,110 @@ func (n NodeCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func execute(name string, c Collector, ch chan<- prometheus.Metric, logger *slog.Logger) {
+	executeWithResults(name, c, ch, logger, &defaultResults)
+}
+
+func executeWithResults(name string, c Collector, ch chan<- prometheus.Metric, logger *slog.Logger, results *collectorResults) {
 	begin := time.Now()
-	err := c.Update(ch)
+	metrics, err := collectToSlice(c)
 	duration := time.Since(begin)
 	var success float64
 
 	if err != nil {
 		if IsNoDataError(err) {
 			logger.Debug("collector returned no data", "name", name, "duration_seconds", duration.Seconds(), "err", err)
+			if results != nil {
+				results.clear(name)
+			}
 		} else {
 			logger.Error("collector failed", "name", name, "duration_seconds", duration.Seconds(), "err", err)
+			if results != nil {
+				for _, metric := range results.load(name) {
+					ch <- unavailableMetric{Metric: metric}
+				}
+			}
 		}
 		success = 0
 	} else {
 		logger.Debug("collector succeeded", "name", name, "duration_seconds", duration.Seconds())
 		success = 1
+		if results != nil {
+			results.store(name, metrics)
+		}
+		for _, metric := range metrics {
+			ch <- metric
+		}
 	}
 	ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, duration.Seconds(), name)
 	ch <- prometheus.MustNewConstMetric(scrapeSuccessDesc, prometheus.GaugeValue, success, name)
+}
+
+// collectToSlice runs a collector with an isolated channel so that partial
+// output is not exposed when the collector subsequently reports an error.
+func collectToSlice(c Collector) ([]prometheus.Metric, error) {
+	metricsCh := make(chan prometheus.Metric)
+	done := make(chan struct{})
+	var metrics []prometheus.Metric
+
+	go func() {
+		defer close(done)
+		for metric := range metricsCh {
+			metrics = append(metrics, metric)
+		}
+	}()
+
+	err := c.Update(metricsCh)
+	close(metricsCh)
+	<-done
+	return metrics, err
+}
+
+// unavailableMetric preserves the descriptor and labels of a previously
+// collected metric while replacing its sample value with NaN.
+type unavailableMetric struct {
+	prometheus.Metric
+}
+
+func (m unavailableMetric) Write(out *dto.Metric) error {
+	if err := m.Metric.Write(out); err != nil {
+		return err
+	}
+
+	unavailable := proto.Clone(out).(*dto.Metric)
+	nan := math.NaN()
+	switch {
+	case unavailable.Gauge != nil:
+		unavailable.Gauge.Value = &nan
+	case unavailable.Counter != nil:
+		unavailable.Counter.Value = &nan
+		unavailable.Counter.Exemplar = nil
+	case unavailable.Untyped != nil:
+		unavailable.Untyped.Value = &nan
+	case unavailable.Summary != nil:
+		unavailable.Summary.SampleSum = &nan
+		for _, quantile := range unavailable.Summary.Quantile {
+			quantile.Value = &nan
+		}
+	case unavailable.Histogram != nil:
+		unavailable.Histogram.SampleSum = &nan
+		if unavailable.Histogram.SampleCountFloat != nil {
+			unavailable.Histogram.SampleCountFloat = &nan
+		}
+		for _, bucket := range unavailable.Histogram.Bucket {
+			if bucket.CumulativeCountFloat != nil {
+				bucket.CumulativeCountFloat = &nan
+			}
+		}
+	}
+
+	out.Label = unavailable.Label
+	out.Gauge = unavailable.Gauge
+	out.Counter = unavailable.Counter
+	out.Summary = unavailable.Summary
+	out.Untyped = unavailable.Untyped
+	out.Histogram = unavailable.Histogram
+	out.TimestampMs = unavailable.TimestampMs
+	return nil
 }
 
 // Collector is the interface a collector has to implement.
